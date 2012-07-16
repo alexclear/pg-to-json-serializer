@@ -1,0 +1,31 @@
+
+README
+
+1. Supported (and tested) PostgreSQL versions: 9.0, 9.1
+
+2. Dependencies
+
+If make executed with OPTION_WITH_DESERIALIZER=1 then libjson ( http://sourceforge.net/projects/libjson/ ) needed for compilation and linking.
+
+INSTALL
+
+The most simple case:
+
+1. make
+2. sudo make install
+3. psql -f install.sql
+
+Installation options:
+
+OPTION_WITH_DESERIALIZER - deserialize utils are needed
+
+If you need to use deserializng feature, please follow instruction:
+
+0. Download libjson ( http://sourceforge.net/projects/libjson/ ).
+Build it with following options: JSON_LIBRARY, JSON_MEMORY_CALLBACKS, JSON_NO_EXCEPTIONS ( edit JSONOptions.h and run "make SHARED=1; sudo make SHARED=1 install" ).
+
+1. Build and install pg-json-serializer
+1.1 make OPTION_WITH_DESERIALIZER=1
+1.2 sudo make install
+1.3 psql -f install.sql deserializer.sql
+
