@@ -18,6 +18,7 @@
 #include "utils/syscache.h"
 #include "catalog/pg_type.h"
 #include "utils/array.h"
+#include <stdio.h>
 
 #include "common.h"
 
@@ -26,10 +27,11 @@
 PG_MODULE_MAGIC;
 #endif
 
+const char *json_hex_chars = "0123456789abcdef";
 
 Datum serialize_record( PG_FUNCTION_ARGS );
 Datum serialize_array( PG_FUNCTION_ARGS );
-char *ConvertToText( Datum, Oid, MemoryContext );
+char *ConvertToText( Datum, Oid, MemoryContext, char** );
 void appendStringInfoQuotedString( StringInfo, const char * );
 
 Datum json_agg_finalfn( PG_FUNCTION_ARGS );
@@ -42,18 +44,87 @@ static Datum json_agg_common_finalfn( PG_FUNCTION_ARGS, bool top_object );
 //----------------------------------------------------------
 
 
+int printbuf_memappend(char* res, int* pos, const char *buf, int size)
+{
+	memcpy(res + *pos, buf, size);
+	*pos += size;
+	res[*pos]= '\0';
+	return size;
+}
+
+static char* json_escape_str(char** presult, char *str)
+{
+	int result_pos = 0;
+	int pos = 0, start_offset = 0;
+	unsigned char c;
+
+	(*presult) = palloc(strlen(str) * 6);
+	(*presult)[0] = 0;
+	do {
+		c = str[pos];
+		switch(c) {
+		case '\0':
+			break;
+		case '\b':
+		case '\n':
+		case '\r':
+		case '\t':
+		case '"':
+		case '\\':
+//		case '/':
+			if(pos - start_offset > 0)
+			{
+				printbuf_memappend(*presult, &result_pos, str + start_offset, pos - start_offset);
+			}
+			if(c == '\b')
+			{
+				printbuf_memappend(*presult, &result_pos, "\\b", 2);
+			}
+			else if(c == '\n')
+			{
+				printbuf_memappend(*presult, &result_pos, "\\n", 2);
+			}
+			else if(c == '\r')
+			{
+				printbuf_memappend(*presult, &result_pos, "\\r", 2);
+			}
+			else if(c == '\t') printbuf_memappend(*presult, &result_pos, "\\t", 2);
+			else if(c == '"') printbuf_memappend(*presult, &result_pos, "\\\"", 2);
+			else if(c == '\\') printbuf_memappend(*presult, &result_pos, "\\\\", 2);
+//			else if(c == '/') printbuf_memappend(*presult, &result_pos, "\\/", 2);
+			start_offset = ++pos;
+			break;
+		default:
+			if(c < ' ') {
+				if(pos - start_offset > 0)
+					printbuf_memappend(*presult, &result_pos, str + start_offset, pos - start_offset);
+				sprintf((*presult)+result_pos, "\\u00%c%c",
+					json_hex_chars[c >> 4],
+					json_hex_chars[c & 0xf]);
+				result_pos += 6;
+				(*presult)[result_pos] = '\0';
+				start_offset = ++pos;
+			} else pos++;
+		}
+	} while(c);
+	if(pos - start_offset > 0)
+		printbuf_memappend(*presult, &result_pos, str + start_offset, pos - start_offset);
+	return *presult;
+}
+
+
 void appendStringInfoQuotedString( StringInfo buf, const char *string )
 {
 	appendStringInfoChar( buf, '"'); //enclose input strings with quotes
 
 	for( ; *string; ++ string )
 	{
-		switch( *string )
-		{
-			case '"': case '\\':
-				appendStringInfoChar( buf, '\\');
-			break;
-		}
+//		switch( *string )
+//		{
+//			case '"': case '\\':
+//				appendStringInfoChar( buf, '\\');
+//			break;
+//		}
 
 		appendStringInfoChar( buf, *string);
 	}
@@ -61,21 +132,42 @@ void appendStringInfoQuotedString( StringInfo buf, const char *string )
 	appendStringInfoChar( buf, '"');
 }
 
-char *ConvertToText( Datum value, Oid column_type, MemoryContext fn_mcxt )
+char *ConvertToText( Datum value, Oid column_type, MemoryContext fn_mcxt, char** pbuf )
 {
 	bool typIsVarlena;
 	Oid typiofunc;
 	FmgrInfo	proc;
+	char*		result;
+//	FILE* log;
+
+//	log = fopen("/var/lib/postgresql/serializer.log", "a");
 
 	getTypeOutputInfo(column_type, &typiofunc, &typIsVarlena);
 	fmgr_info_cxt( typiofunc, &proc, fn_mcxt );
 
-	return OutputFunctionCall( &proc, value );
+//	fprintf(log, "Oid of function: %i\n", proc.fn_oid);
+
+	result =  OutputFunctionCall( &proc, value );
+
+	if((column_type != INT8OID) && (column_type != BOOLOID) &&
+           (column_type != INT4OID) && (column_type != FLOAT8OID) &&
+           (column_type != INT2OID) && (column_type != FLOAT4OID)) {
+//		fprintf(log, "WELL WELL\n");
+		result = json_escape_str(pbuf, result);
+//		fprintf(log, "result: %s\n", result);
+//		fclose(log);
+		return result;
+	}
+//	fclose(log);
+	return result;
 }
 
 PG_FUNCTION_INFO_V1( serialize_record );
 Datum serialize_record( PG_FUNCTION_ARGS )
 {
+//	FILE* log;
+
+//	log = fopen("/var/lib/postgresql/serializer.log", "a");
 	HeapTupleHeader rec = PG_GETARG_HEAPTUPLEHEADER(0);
 
 	HeapTupleData tuple;
@@ -84,6 +176,7 @@ Datum serialize_record( PG_FUNCTION_ARGS )
 	Datum	  *values;
 	bool	   *nulls;
 	StringInfoData buf;
+	char *conversion_buf;
 
 	/* Extract type info from the tuple itself */
 	Oid tupType = HeapTupleHeaderGetTypeId(rec);
@@ -97,6 +190,8 @@ Datum serialize_record( PG_FUNCTION_ARGS )
 	tuple.t_tableOid = InvalidOid;
 	tuple.t_data = rec;
 
+//	fprintf(log, "Doing serialize_record\n");
+//	fflush(log);
 
 	values = (Datum *) palloc(ncolumns * sizeof(Datum));
 	nulls = (bool *) palloc(ncolumns * sizeof(bool));
@@ -182,10 +277,22 @@ Datum serialize_record( PG_FUNCTION_ARGS )
 
 			case 'N': //numeric
 
+				conversion_buf = NULL;
 				// get column text value
-				value = ConvertToText( values[ i ], column_type, fcinfo->flinfo->fn_mcxt );
+//				fprintf(log, "Calling ConvertToText\n");
+//				fflush(log);
+				value = ConvertToText( values[ i ], column_type, fcinfo->flinfo->fn_mcxt, &conversion_buf );
+//				fprintf(log, "ConvertToText succeded\n");
+//				fflush(log);
 
 				appendStringInfoString(&buf, value);
+//				fprintf(log, "append.... succeded\n");
+//				fflush(log);
+
+				if(conversion_buf != NULL) {
+					pfree(conversion_buf);
+					conversion_buf = NULL;
+				}
 
 			break;
 
@@ -198,10 +305,22 @@ Datum serialize_record( PG_FUNCTION_ARGS )
 
 			default: //another
 
+				conversion_buf = NULL;
 				// get column text value
-				value = ConvertToText( values[ i ], column_type, fcinfo->flinfo->fn_mcxt );
+//				fprintf(log, "Calling ConvertToText\n");
+//				fflush(log);
+				value = ConvertToText( values[ i ], column_type, fcinfo->flinfo->fn_mcxt, &conversion_buf );
+//				fprintf(log, "ConvertToText succeded\n");
+//				fflush(log);
 
 				appendStringInfoQuotedString(&buf, value);
+//				fprintf(log, "append.... succeded\n");
+//				fflush(log);
+
+				if(conversion_buf != NULL) {
+					pfree(conversion_buf);
+					conversion_buf = NULL;
+				}
 		}
 	}
 
@@ -210,6 +329,8 @@ Datum serialize_record( PG_FUNCTION_ARGS )
 	pfree(values);
 	pfree(nulls);
 	ReleaseTupleDesc(tupdesc);
+
+//	fclose(log);
 
 	PG_RETURN_TEXT_P( PG_CSTR_GET_TEXT( buf.data ) );
 }
@@ -237,6 +358,13 @@ Datum serialize_array(PG_FUNCTION_ARGS)
 	FmgrInfo	proc, flinfo;
 
 	StringInfoData buf;
+
+//	FILE* log;
+
+//	log = fopen("/var/lib/postgresql/serializer.log", "a");
+
+//	fprintf(log, "Doing serialize_array\n");
+//	fflush(log);
 
 	/*
 	 * Get info about element type, including its output conversion proc
@@ -340,6 +468,8 @@ Datum serialize_array(PG_FUNCTION_ARGS)
 		}
 	}
 	appendStringInfoChar(&buf, ']');
+
+//	fclose(log);
 
 	//PG_RETURN_CSTRING(retval);
 	PG_RETURN_TEXT_P( PG_CSTR_GET_TEXT( buf.data ) );
